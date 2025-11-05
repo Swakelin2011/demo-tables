@@ -1163,7 +1163,62 @@ def validate_consistency(table, continuous_vars):
         print(f"\n✅ All continuous variables have consistent formatting!")
         return True
 
-
-if __name__ == "__main__":
-    # Run example
-    sample_df, result_table = example_usage()
+def create_odds_ratio_table(model, alpha=0.05):
+    """
+    Creates an odds ratio table from a fitted logistic regression model
+    
+    Parameters:
+    -----------
+    model : fitted statsmodels logistic regression model
+        The fitted model from statsmodels (e.g., smf.logit().fit())
+    alpha : float, default=0.05
+        Significance level for confidence intervals (default 0.05 for 95% CI)
+    
+    Returns:
+    --------
+    pandas.DataFrame
+        DataFrame with columns: Coefficient, Odds Ratio, Lower CI, Upper CI, P-value, Sig
+    
+    Example:
+    --------
+    >>> model = smf.logit('outcome ~ var1 + var2', data=df).fit()
+    >>> or_table = create_odds_ratio_table(model)
+    >>> print(or_table)
+    """
+    import pandas as pd
+    import numpy as np
+    
+    # Get coefficients and confidence intervals
+    params = model.params
+    conf = model.conf_int(alpha=alpha)
+    conf.columns = ['Lower CI', 'Upper CI']
+    
+    # Calculate odds ratios
+    odds_ratios = np.exp(params)
+    or_conf = np.exp(conf)
+    
+    # Get p-values
+    pvalues = model.pvalues
+    
+    # Create the table
+    or_table = pd.DataFrame({
+        'Coefficient': params,
+        'Odds Ratio': odds_ratios,
+        'Lower CI': or_conf['Lower CI'],
+        'Upper CI': or_conf['Upper CI'],
+        'P-value': pvalues
+    })
+    
+    # Round appropriately
+    or_table['Coefficient'] = or_table['Coefficient'].round(4)
+    or_table['Odds Ratio'] = or_table['Odds Ratio'].round(4)
+    or_table['Lower CI'] = or_table['Lower CI'].round(4)
+    or_table['Upper CI'] = or_table['Upper CI'].round(4)
+    or_table['P-value'] = or_table['P-value'].round(4)
+    
+    # Add significance stars
+    or_table['Sig'] = or_table['P-value'].apply(
+        lambda x: '***' if x < 0.001 else '**' if x < 0.01 else '*' if x < 0.05 else ''
+    )
+    
+    return or_table
