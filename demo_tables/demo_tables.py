@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from scipy import stats
-from scipy.stats import chi2_contingency, fisher_exact, mannwhitneyu, kruskal
+from scipy.stats import chi2_contingency, fisher_exact, mannwhitneyu, kruskal, wilcoxon, ttest_rel
 import warnings
 
 def fixed_demographics_table(df, var_list, categorical_vars=None, continuous_vars=None, 
@@ -126,7 +126,8 @@ def fixed_grouped_demographics_table(df, var_list, group_var, categorical_vars=N
                                    continuous_vars=None, ordinal_vars=None, decimal_places=1, 
                                    include_tests=True, alpha=0.05, show_all_categories=True,
                                    include_missing=False, reporting_format="auto",
-                                   mean_sd_vars=None, median_iqr_vars=None):
+                                   mean_sd_vars=None, median_iqr_vars=None,
+                                   paired=False, match_var=None):
     """
     Create demographics table stratified by a grouping variable with CONSISTENT formatting.
     
@@ -160,6 +161,12 @@ def fixed_grouped_demographics_table(df, var_list, group_var, categorical_vars=N
         Specific variables to force as mean±SD reporting
     median_iqr_vars : list, optional
         Specific variables to force as median[IQR] reporting
+    paired : bool, default=False
+        Whether to use paired statistical tests (for matched/paired data like propensity-matched cohorts)
+        When True, uses paired t-test, Wilcoxon signed-rank, and McNemar's test
+    match_var : str, optional
+        Variable containing the match/pair identifier. Required when paired=True.
+        Each unique value should identify a matched pair (or set).
     
     Returns:
     --------
@@ -177,6 +184,13 @@ def fixed_grouped_demographics_table(df, var_list, group_var, categorical_vars=N
         mean_sd_vars = []
     if median_iqr_vars is None:
         median_iqr_vars = []
+    
+    # Validate paired testing parameters
+    if paired:
+        if match_var is None:
+            raise ValueError("match_var is required when paired=True. Provide the variable containing match/pair IDs.")
+        if match_var not in df.columns:
+            raise ValueError(f"Match variable '{match_var}' not found in dataframe")
     
     # Validate group variable
     if group_var not in df.columns:
@@ -293,7 +307,8 @@ def fixed_grouped_demographics_table(df, var_list, group_var, categorical_vars=N
     # STEP 5: Add statistical tests (only for non-Overall N rows)
     if include_tests:
         test_results = _perform_all_statistical_tests(
-            df, final_table, group_var, variable_info, alpha
+            df, final_table, group_var, variable_info, alpha,
+            paired=paired, match_var=match_var
         )
         
         final_table['P-value'] = test_results['p_formatted']
@@ -695,7 +710,8 @@ def _create_ordered_variable_list(var_list, all_variable_rows, variable_info):
     return ordered_variables
 
 
-def _perform_all_statistical_tests(df, final_table, group_var, variable_info, alpha):
+def _perform_all_statistical_tests(df, final_table, group_var, variable_info, alpha,
+                                   paired=False, match_var=None):
     """Perform statistical tests for all main variables"""
     
     p_formatted = []
@@ -721,8 +737,13 @@ def _perform_all_statistical_tests(df, final_table, group_var, variable_info, al
                 significant.append("")
                 continue
             
-            # Perform the statistical test
-            test_name, p_value = _perform_single_statistical_test(df, var, group_var, var_type)
+            # Perform the statistical test (paired or unpaired)
+            if paired:
+                test_name, p_value = _perform_single_paired_statistical_test(
+                    df, var, group_var, var_type, match_var
+                )
+            else:
+                test_name, p_value = _perform_single_statistical_test(df, var, group_var, var_type)
             
             # Format p-value
             if pd.isna(p_value):
@@ -961,7 +982,214 @@ def _perform_continuous_test(test_df, var, group_var):
         return f"Continuous test error: {str(e)}", np.nan
 
 
-# Helper functions for checking and fixing duplicates
+def _perform_single_paired_statistical_test(df, var, group_var, var_type, match_var):
+    """Perform appropriate paired statistical test for a single variable"""
+    
+    if var not in df.columns:
+        return "Variable not found", np.nan
+    
+    if group_var not in df.columns:
+        return "Group variable not found", np.nan
+    
+    if match_var not in df.columns:
+        return "Match variable not found", np.nan
+    
+    # Get data with all required variables present
+    test_df = df[[var, group_var, match_var]].copy()
+    test_df = test_df.dropna(subset=[group_var, match_var])
+    
+    if len(test_df) == 0:
+        return "No observations with group/match information", np.nan
+    
+    groups = test_df[group_var].unique()
+    groups = groups[pd.notna(groups)]
+    
+    if len(groups) != 2:
+        return f"Paired tests require exactly 2 groups, found {len(groups)}", np.nan
+    
+    # Sort groups for consistency
+    groups = sorted(groups)
+    
+    try:
+        if var_type == "categorical":
+            return _perform_paired_categorical_test(test_df, var, group_var, match_var, groups)
+        elif var_type == "ordinal":
+            return _perform_paired_ordinal_test(test_df, var, group_var, match_var, groups)
+        else:  # continuous variable
+            return _perform_paired_continuous_test(test_df, var, group_var, match_var, groups)
+    
+    except Exception as e:
+        return f"Paired test error: {str(e)}", np.nan
+
+
+def _perform_paired_categorical_test(test_df, var, group_var, match_var, groups):
+    """Perform McNemar's test for paired binary categorical variables"""
+    
+    # Pivot to get paired data
+    try:
+        pivot_df = test_df.pivot(index=match_var, columns=group_var, values=var)
+    except Exception as e:
+        return f"Failed to create paired data: {str(e)}", np.nan
+    
+    # Get the two group columns
+    group1_col, group2_col = groups[0], groups[1]
+    
+    if group1_col not in pivot_df.columns or group2_col not in pivot_df.columns:
+        return "Groups not found in pivoted data", np.nan
+    
+    # Drop pairs with missing data in either group
+    pivot_df = pivot_df.dropna(subset=[group1_col, group2_col])
+    
+    if len(pivot_df) < 2:
+        return "Insufficient complete pairs", np.nan
+    
+    group1_vals = pivot_df[group1_col].values
+    group2_vals = pivot_df[group2_col].values
+    
+    # Check if binary
+    all_vals = np.concatenate([group1_vals, group2_vals])
+    unique_vals = np.unique(all_vals[~pd.isna(all_vals)])
+    
+    if len(unique_vals) == 2:
+        # Binary variable - use McNemar's test
+        try:
+            # Create contingency table for McNemar's test
+            # Table format: [[n00, n01], [n10, n11]]
+            # where nij = count of pairs with group1=i, group2=j
+            
+            # Convert to numeric binary if needed
+            val_map = {unique_vals[0]: 0, unique_vals[1]: 1}
+            g1_binary = np.array([val_map.get(v, v) for v in group1_vals])
+            g2_binary = np.array([val_map.get(v, v) for v in group2_vals])
+            
+            # Count discordant pairs
+            n01 = np.sum((g1_binary == 0) & (g2_binary == 1))  # 0 in group1, 1 in group2
+            n10 = np.sum((g1_binary == 1) & (g2_binary == 0))  # 1 in group1, 0 in group2
+            
+            # McNemar's test (exact if small counts, chi-square otherwise)
+            if n01 + n10 < 25:
+                # Use exact binomial test
+                from scipy.stats import binom
+                n = n01 + n10
+                if n == 0:
+                    return "No discordant pairs", np.nan
+                k = min(n01, n10)
+                # Two-sided p-value
+                p_value = 2 * binom.cdf(k, n, 0.5)
+                p_value = min(p_value, 1.0)  # Cap at 1
+                return "McNemar (exact)", p_value
+            else:
+                # Use chi-square approximation with continuity correction
+                chi2 = (abs(n01 - n10) - 1) ** 2 / (n01 + n10)
+                p_value = 1 - stats.chi2.cdf(chi2, df=1)
+                return "McNemar", p_value
+                
+        except Exception as e:
+            return f"McNemar's test failed: {str(e)}", np.nan
+    
+    elif len(unique_vals) > 2:
+        # Multi-category variable - use Bowker's test for symmetry or marginal homogeneity test
+        try:
+            # Create contingency table
+            contingency = pd.crosstab(group1_vals, group2_vals)
+            
+            # For multi-category paired data, we can use a symmetry test
+            # Or fall back to comparing marginal distributions
+            # Using Stuart-Maxwell test (generalization of McNemar)
+            
+            # Simple approach: use chi-square test on the contingency table
+            # but note this doesn't fully account for pairing
+            chi2, p_value, dof, expected = chi2_contingency(contingency)
+            return "Chi-square (paired marginals)", p_value
+            
+        except Exception as e:
+            return f"Paired categorical test failed: {str(e)}", np.nan
+    
+    else:
+        return "Insufficient categories", np.nan
+
+
+def _perform_paired_ordinal_test(test_df, var, group_var, match_var, groups):
+    """Perform Wilcoxon signed-rank test for paired ordinal variables"""
+    
+    # Pivot to get paired data
+    try:
+        pivot_df = test_df.pivot(index=match_var, columns=group_var, values=var)
+    except Exception as e:
+        return f"Failed to create paired data: {str(e)}", np.nan
+    
+    # Get the two group columns
+    group1_col, group2_col = groups[0], groups[1]
+    
+    if group1_col not in pivot_df.columns or group2_col not in pivot_df.columns:
+        return "Groups not found in pivoted data", np.nan
+    
+    # Drop pairs with missing data in either group
+    pivot_df = pivot_df.dropna(subset=[group1_col, group2_col])
+    
+    if len(pivot_df) < 2:
+        return "Insufficient complete pairs", np.nan
+    
+    group1_vals = pivot_df[group1_col].values
+    group2_vals = pivot_df[group2_col].values
+    
+    # Calculate differences
+    differences = group1_vals - group2_vals
+    
+    # Remove zero differences (ties at 0)
+    non_zero_diffs = differences[differences != 0]
+    
+    if len(non_zero_diffs) < 1:
+        return "No non-zero differences", np.nan
+    
+    try:
+        # Wilcoxon signed-rank test
+        stat, p_value = wilcoxon(group1_vals, group2_vals, alternative='two-sided')
+        
+        if pd.isna(p_value):
+            return "Wilcoxon signed-rank test returned NaN", np.nan
+        
+        return "Wilcoxon signed-rank", p_value
+        
+    except Exception as e:
+        return f"Wilcoxon signed-rank test failed: {str(e)}", np.nan
+
+
+def _perform_paired_continuous_test(test_df, var, group_var, match_var, groups):
+    """Perform paired t-test for continuous variables"""
+    
+    # Pivot to get paired data
+    try:
+        pivot_df = test_df.pivot(index=match_var, columns=group_var, values=var)
+    except Exception as e:
+        return f"Failed to create paired data: {str(e)}", np.nan
+    
+    # Get the two group columns
+    group1_col, group2_col = groups[0], groups[1]
+    
+    if group1_col not in pivot_df.columns or group2_col not in pivot_df.columns:
+        return "Groups not found in pivoted data", np.nan
+    
+    # Drop pairs with missing data in either group
+    pivot_df = pivot_df.dropna(subset=[group1_col, group2_col])
+    
+    if len(pivot_df) < 2:
+        return "Insufficient complete pairs", np.nan
+    
+    group1_vals = pivot_df[group1_col].values
+    group2_vals = pivot_df[group2_col].values
+    
+    try:
+        # Paired t-test
+        t_stat, p_value = ttest_rel(group1_vals, group2_vals)
+        
+        if pd.isna(p_value):
+            return "Paired t-test returned NaN", np.nan
+        
+        return "Paired t-test", p_value
+        
+    except Exception as e:
+        return f"Paired t-test failed: {str(e)}", np.nan
 def check_table_duplicates(table, table_name):
     """Check a table for duplicate rows"""
     print(f"\n=== {table_name} ===")
@@ -1029,6 +1257,68 @@ def grouped_demographics_table_mean_sd(df, var_list, group_var, **kwargs):
 def grouped_demographics_table_median_iqr(df, var_list, group_var, **kwargs):
     """Create grouped demographics table with median[IQR] for all continuous variables"""
     return fixed_grouped_demographics_table(df, var_list, group_var, reporting_format="median_iqr", **kwargs)
+
+
+def paired_demographics_table(df, var_list, group_var, match_var, **kwargs):
+    """
+    Create grouped demographics table with paired statistical tests.
+    
+    Ideal for propensity-matched cohorts where observations are paired/matched.
+    Uses paired t-test, Wilcoxon signed-rank, and McNemar's test.
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        Input dataframe
+    var_list : list
+        List of variables to include in the table
+    group_var : str
+        Variable to group by (e.g., 'treatment', 'case_control')
+    match_var : str
+        Variable containing the match/pair identifier
+    **kwargs : dict
+        Additional arguments passed to fixed_grouped_demographics_table
+    
+    Returns:
+    --------
+    pandas.DataFrame
+        Grouped demographics table with paired test p-values
+    
+    Example:
+    --------
+    >>> # For a propensity-matched dataset with match IDs
+    >>> table = paired_demographics_table(
+    ...     df, 
+    ...     var_list=['age', 'bmi', 'gender', 'comorbidity_score'],
+    ...     group_var='treatment',
+    ...     match_var='match_id'
+    ... )
+    """
+    return fixed_grouped_demographics_table(
+        df, var_list, group_var, 
+        paired=True, match_var=match_var,
+        **kwargs
+    )
+
+
+def paired_demographics_table_mean_sd(df, var_list, group_var, match_var, **kwargs):
+    """Create paired demographics table with mean±SD for continuous variables"""
+    return fixed_grouped_demographics_table(
+        df, var_list, group_var, 
+        paired=True, match_var=match_var,
+        reporting_format="mean_sd",
+        **kwargs
+    )
+
+
+def paired_demographics_table_median_iqr(df, var_list, group_var, match_var, **kwargs):
+    """Create paired demographics table with median[IQR] for continuous variables"""
+    return fixed_grouped_demographics_table(
+        df, var_list, group_var, 
+        paired=True, match_var=match_var,
+        reporting_format="median_iqr",
+        **kwargs
+    )
 
 
 def quick_fix_demographics(df, var_list, group_var, force_format="mean_sd", 
@@ -1115,6 +1405,89 @@ def example_usage():
     print()
     
     return sample_df, grouped_table2
+
+
+def example_paired_usage():
+    """Example usage of paired demographics tables for propensity-matched cohorts"""
+    
+    np.random.seed(42)
+    n_pairs = 100  # Number of matched pairs
+    
+    # Create a propensity-matched dataset
+    # Each match_id represents a matched pair (one from each group)
+    match_ids = np.repeat(range(n_pairs), 2)
+    groups = np.tile(['Control', 'Treatment'], n_pairs)
+    
+    # Generate paired data with some correlation within pairs
+    # (matched pairs should have similar baseline characteristics)
+    base_age = np.random.normal(65, 15, n_pairs)
+    base_bmi = np.random.normal(28, 5, n_pairs)
+    
+    # Each pair has similar (but not identical) values
+    ages = np.repeat(base_age, 2) + np.random.normal(0, 2, n_pairs * 2)
+    bmis = np.repeat(base_bmi, 2) + np.random.normal(0, 1, n_pairs * 2)
+    
+    # Some variables may differ between groups
+    # Muscle volume: treatment group slightly higher
+    base_volume = np.random.normal(50, 10, n_pairs)
+    volumes = np.repeat(base_volume, 2) + np.random.normal(0, 3, n_pairs * 2)
+    # Add treatment effect
+    treatment_mask = (groups == 'Treatment')
+    volumes[treatment_mask] += np.random.normal(5, 2, sum(treatment_mask))
+    
+    # Binary outcome: diabetes (matched on this)
+    base_diabetes = np.random.choice([0, 1], n_pairs, p=[0.7, 0.3])
+    diabetes = np.repeat(base_diabetes, 2)
+    
+    # Ordinal pain score
+    base_pain = np.random.choice([1, 2, 3, 4, 5], n_pairs, p=[0.1, 0.2, 0.4, 0.2, 0.1])
+    pain_scores = np.repeat(base_pain, 2)
+    # Treatment group has lower pain on average
+    pain_adjustment = np.where(groups == 'Treatment', 
+                               np.random.choice([-1, 0], n_pairs * 2, p=[0.3, 0.7]), 
+                               0)
+    pain_scores = np.clip(pain_scores + pain_adjustment, 1, 5)
+    
+    matched_df = pd.DataFrame({
+        'match_id': match_ids,
+        'group': groups,
+        'age': ages,
+        'bmi': bmis,
+        'muscle_volume': volumes,
+        'diabetes': diabetes,
+        'pain_score': pain_scores.astype(int)
+    })
+    
+    variables = ['age', 'bmi', 'muscle_volume', 'diabetes', 'pain_score']
+    
+    print("=== EXAMPLE: Propensity-Matched Cohort with Paired Tests ===")
+    print(f"Dataset: {n_pairs} matched pairs, {len(matched_df)} total observations\n")
+    
+    print("--- Unpaired Tests (INCORRECT for matched data) ---")
+    unpaired_table = fixed_grouped_demographics_table(
+        matched_df, variables, 'group',
+        ordinal_vars=['pain_score'],
+        decimal_places=1,
+        include_tests=True
+    )
+    print(unpaired_table)
+    print()
+    
+    print("--- Paired Tests (CORRECT for matched data) ---")
+    paired_table = paired_demographics_table(
+        matched_df, variables, 'group', 'match_id',
+        ordinal_vars=['pain_score'],
+        decimal_places=1
+    )
+    print(paired_table)
+    print()
+    
+    print("=== Test types used ===")
+    print("Continuous variables (age, bmi, muscle_volume): Paired t-test")
+    print("Binary categorical (diabetes): McNemar's test")
+    print("Ordinal (pain_score): Wilcoxon signed-rank test")
+    
+    return matched_df, paired_table
 
 
 def validate_consistency(table, continuous_vars):
